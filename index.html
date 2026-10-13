@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width" />
+<title>ShowPrice</title>
+<!--
+  Tribe Sønderborg – ViewNet price sign (144 x 96 px)
+  Rebuilt from Better Energy's original ShowPrice.cshtml / EnergyPrice.css / EnergyPriceService.cs.
+
+  Price shown = (DK1 day-ahead spot, hourly average, DKK/kWh – from prices.json) x 1.25 VAT
+                + N1 "B-høj" net tariff (incl. VAT)
+                + Tribe surcharge 2.00 DKK/kWh (incl. VAT)
+  Same formula as BE's CalculateTotalConsumerPrice() and the Monta "Public" price group.
+
+  URL options:  ?mode=open    -> shows ÅBEN
+                ?mode=closed  -> shows LUKKET / CLOSED / GESCHLOSSEN (BE's closed layout)
+-->
+<style>
+/* ---- Original Better Energy stylesheet (EnergyPrice.css), unchanged ---- */
+body { background-color: black; margin: 0 !important; }
+.HourlyInformation {
+  display: flex; flex-direction: row; justify-content: space-between;
+  width: calc(100% - 12px); align-items: flex-end; font-weight: bold;
+  color: white; position: relative; padding: 0 6px;
+}
+.HourlyInformation:first-child { border-bottom: 1px solid #d1681a; padding-bottom: 4px; }
+.HourlyInformation.text:nth-child(2) { border-bottom: 1px solid #d1681a; padding-bottom: 4px; }
+.CurrencyDefinition { font-family: "freight-sans-pro", sans-serif; font-size: 8px; text-align: right; padding-bottom: 4px; }
+#NextCurrencyDefinition { font-family: "freight-sans-pro", sans-serif; font-size: 8px; text-align: right; padding-bottom: 2px; }
+.PriceValue { font-family: "Open Sans", sans-serif; font-weight: normal; letter-spacing: -0.3px; }
+.PriceValue.first { font-size: 46px; line-height: 44px; }
+.PriceValue.second { font-size: 38px; line-height: 34px; }
+#NextHourDiv { padding-top: 1px; display: flex; }
+.NextHourDivWrapper { display: flex; flex-direction: column; justify-content: space-between; height: 100%; }
+#NextHourText { font-family: "freight-sans-pro", sans-serif; font-size: 8px; text-align: right; }
+#EnergyPriceDiv {
+  width: 144px; height: 96px; display: flex; align-items: center; justify-content: center;
+  flex-direction: column; padding: 0; gap: 4px;
+}
+.EnergyPriceWrapper {
+  max-height: 100vh; max-width: 100vw; width: 100vw; height: 100vh;
+  display: flex; justify-content: center; align-items: center;
+}
+p { margin-block-start: 0em; margin-block-end: 0em; margin: 0; }
+.closedText { font-family: "freight-sans-pro", sans-serif; text-align: center; font-size: 24px; }
+.closedText.long { font-size: 17px; }
+.closedDiv { width: 100%; }
+/* ---- additions ---- */
+.openText { font-family: "freight-sans-pro", sans-serif; text-align: center; font-size: 40px; color: white; }
+.hidden { display: none !important; }
+</style>
+</head>
+<body>
+
+<!-- Prices (BE layout) -->
+<div class="EnergyPriceWrapper hidden" id="viewPrices">
+  <div id="EnergyPriceDiv">
+    <div class="HourlyInformation">
+      <p class="PriceValue first" id="currentPrice">-</p>
+      <a class="CurrencyDefinition">Kr. / kWh</a>
+    </div>
+    <div class="HourlyInformation">
+      <p class="PriceValue second" id="nextPrice">-</p>
+      <div class="NextHourDivWrapper">
+        <div id="NextHourDiv"><a id="NextHourText">Næste time</a></div>
+        <a class="CurrencyDefinition" id="NextCurrencyDefinition">Kr. / kWh</a>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Open (shown with ?mode=open, or if no price data can be fetched) -->
+<div class="EnergyPriceWrapper hidden" id="viewOpen">
+  <div id="EnergyPriceDiv"><p class="openText">ÅBEN</p></div>
+</div>
+
+<!-- Closed (BE layout) -->
+<div class="EnergyPriceWrapper hidden" id="viewClosed">
+  <div id="EnergyPriceDiv">
+    <div class="HourlyInformation text"><div class="closedDiv"><p class="PriceValue closedText">LUKKET</p></div></div>
+    <div class="HourlyInformation text"><div class="closedDiv"><p class="PriceValue closedText">CLOSED</p></div></div>
+    <div class="HourlyInformation text"><div class="closedDiv"><p class="PriceValue closedText long">GESCHLOSSEN</p></div></div>
+  </div>
+</div>
+
+<script>
+// ES5 + XMLHttpRequest on purpose: sign players often run old browser engines.
+var CONFIG = {
+  priceArea: 'DK1',
+  vat: 1.25,                 // applied to spot only (tariff and surcharge are already incl. VAT)
+  surcharge: 2.00,           // DKK/kWh incl. VAT – Monta "Additional pricing"
+  minPrice: null,            // e.g. 2.00 to floor the price like BE did; null = no floor
+  decimalSeparator: '.',     // BE's sign printed with "." – change to ',' for Danish style
+  // N1 "B-høj" (#25), DKK/kWh incl. VAT, Europe/Copenhagen local time.
+  // Winter season Oct–Mar is from Monta (season 2026-10-01 → 2027-03-31).
+  tariff: {
+    low: 0.0338, high: 0.1014, peak: 0.2028,
+    winterMonths: [10, 11, 12, 1, 2, 3]
+  },
+  fetchEveryMin: 15,
+  reloadPageEveryHours: 6
+};
+
+function tariffFor(month, weekday, hour) {   // weekday: 0=Sun..6=Sat, local Copenhagen time
+  var t = CONFIG.tariff;
+  var weekend = (weekday === 0 || weekday === 6);
+  var winter = t.winterMonths.indexOf(month) !== -1;
+  if (hour < 6) return t.low;
+  if (winter) {
+    if (weekend) return t.high;              // Sat–Sun 06–24
+    return hour < 21 ? t.peak : t.high;      // Mon–Fri 06–21 peak, 21–24 high
+  }
+  // Summer (Apr–Sep): N1 structure – Mon–Fri 06–24 high, weekends low. VERIFY in Monta before April.
+  return weekend ? t.low : t.high;
+}
+
+function show(id) {
+  var ids = ['viewPrices', 'viewOpen', 'viewClosed'];
+  for (var i = 0; i < ids.length; i++) {
+    document.getElementById(ids[i]).className = 'EnergyPriceWrapper' + (ids[i] === id ? '' : ' hidden');
+  }
+}
+
+function fmt(v) { return v.toFixed(2).replace('.', CONFIG.decimalSeparator); }
+
+var hours = {};        // key = UTC hour "YYYY-MM-DDTHH" -> {dk: "YYYY-MM-DDTHH" (Copenhagen time), spot: DKK/kWh excl. VAT}
+
+function ingest(data) {
+  var h = {}, list = (data && data.hours) || [];
+  for (var i = 0; i < list.length; i++) h[list[i].utc] = list[i];
+  if (list.length) {
+    hours = h;
+    try { localStorage.setItem('tribeSignHours', JSON.stringify(h)); } catch (e) {}
+  }
+}
+
+function priceForKey(key) {
+  var e = hours[key];
+  if (!e || typeof e.spot !== 'number') return null;
+  // Local (Copenhagen) date/hour comes from the data itself – no timezone maths on the player
+  var y = +e.dk.substr(0, 4), mo = +e.dk.substr(5, 2), d = +e.dk.substr(8, 2), hr = +e.dk.substr(11, 2);
+  var weekday = new Date(Date.UTC(y, mo - 1, d)).getUTCDay();
+  var p = e.spot * CONFIG.vat + tariffFor(mo, weekday, hr) + CONFIG.surcharge;
+  if (CONFIG.minPrice !== null && p < CONFIG.minPrice) p = CONFIG.minPrice;
+  return p;
+}
+
+function utcKey(ms) { return new Date(ms).toISOString().substr(0, 13); }
+
+function render() {
+  var mode = (location.search.match(/[?&]mode=(\w+)/) || [])[1];
+  if (mode === 'open')   { show('viewOpen');   return; }
+  if (mode === 'closed') { show('viewClosed'); return; }
+
+  var now = Date.now();
+  var cur = priceForKey(utcKey(now));
+  var nxt = priceForKey(utcKey(now + 3600000));
+  if (cur === null) { show('viewOpen'); return; }     // no data -> safe fallback
+  document.getElementById('currentPrice').innerHTML = fmt(cur);
+  document.getElementById('nextPrice').innerHTML = nxt === null ? '-' : fmt(nxt);
+  show('viewPrices');
+}
+
+function fetchPrices() {
+  // prices.json sits next to this page and is refreshed hourly by a GitHub Action
+  var xhr = new XMLHttpRequest();
+  xhr.open('GET', 'prices.json?t=' + Date.now(), true);
+  xhr.timeout = 20000;
+  xhr.onload = function () {
+    if (xhr.status === 200) { try { ingest(JSON.parse(xhr.responseText)); } catch (e) {} }
+    render();
+  };
+  xhr.onerror = xhr.ontimeout = function () { render(); };
+  xhr.send();
+}
+
+// Start: show cached prices immediately (if any), then fetch fresh ones
+try { var c = localStorage.getItem('tribeSignHours'); if (c) hours = JSON.parse(c); } catch (e) {}
+render();
+fetchPrices();
+setInterval(render, 30 * 1000);
+setInterval(fetchPrices, CONFIG.fetchEveryMin * 60 * 1000);
+setTimeout(function () { location.reload(); }, CONFIG.reloadPageEveryHours * 3600 * 1000);
+</script>
+</body>
+</html>
